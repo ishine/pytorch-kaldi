@@ -12,78 +12,164 @@ import os
 import configparser
 import re, gzip, struct
 
-
 def load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only=False):
-
-    
-    fea = { k:m for k,m in read_mat_ark('ark:copy-feats scp:'+fea_scp+' ark:- |'+fea_opts,output_folder) }
-
-    if not fea_only:
-      lab = { k:v for k,v in read_vec_int_ark('gunzip -c '+lab_folder+'/ali*.gz | '+lab_opts+' '+lab_folder+'/final.mdl ark:- ark:-|',output_folder)  if k in fea} # Note that I'm copying only the aligments of the loaded fea
-      fea = {k: v for k, v in fea.items() if k in lab} # This way I remove all the features without an aligment (see log file in alidir "Did not Succeded")
-
-    end_snt=0
-    end_index=[]
-    snt_name=[]
-    fea_conc=[]
-    lab_conc=[]
-    
-    tmp=0
-    for k in sorted(sorted(fea.keys()), key=lambda k: len(fea[k])):
-
-        #####
-        # If the sequence length is above the threshold, we split it with a minimal length max/4
-        # If max length = 500, then the split will start at 500 + (500/4) = 625. 
-        # A seq of length 625 will be splitted in one of 500 and one of 125
-
-        
-        if(len(fea[k]) > max_sequence_length) and max_sequence_length>0:
-
-          fea_chunked = []
-          lab_chunked = []
-
-          for i in range((len(fea[k]) + max_sequence_length - 1) // max_sequence_length):
-            if(len(fea[k][i * max_sequence_length:]) > max_sequence_length + (max_sequence_length/4)):
-              fea_chunked.append(fea[k][i * max_sequence_length:(i + 1) * max_sequence_length])
-              if not fea_only:
-                lab_chunked.append(lab[k][i * max_sequence_length:(i + 1) * max_sequence_length])
-              else:
-                lab_chunked.append(np.zeros((fea[k][i * max_sequence_length:(i + 1) * max_sequence_length].shape[0],)))
+    def _input_is_wav_file(fea_scp):
+        with open(fea_scp, 'r') as f:
+            first_line = f.readline()
+        ark_file = first_line.split(' ')[1].split(':')[0]
+        with open(ark_file, 'rb') as f:
+            first_ark_line = f.readline()
+        return b'RIFF' in first_ark_line
+    def _input_is_feature_file(fea_scp):
+        return not _input_is_wav_file(fea_scp)
+    def _read_features_and_labels_with_kaldi(fea_scp, fea_opts, fea_only, lab_folder, lab_opts, output_folder):
+        fea = dict()
+        lab = dict()
+        if _input_is_feature_file(fea_scp):
+            kaldi_bin="copy-feats"
+            read_function = read_mat_ark
+        elif _input_is_wav_file(fea_scp):
+            kaldi_bin="wav-copy"
+            read_function = read_vec_flt_ark
+        fea = { k:m for k,m in read_function('ark:'+kaldi_bin+' scp:'+fea_scp+' ark:- |'+fea_opts,output_folder) }
+        if not fea_only:
+            lab = { k:v for k,v in read_vec_int_ark('gunzip -c '+lab_folder+'/ali*.gz | '+lab_opts+' '+lab_folder+'/final.mdl ark:- ark:-|',output_folder)  if k in fea} # Note that I'm copying only the aligments of the loaded fea
+            fea = {k: v for k, v in fea.items() if k in lab} # This way I remove all the features without an aligment (see log file in alidir "Did not Succeded")
+        return fea, lab
+    def _chunk_features_and_labels(max_sequence_length, fea, lab, fea_only, input_is_wav):
+        def _append_to_concat_list(fea_chunked, lab_chunked, fea_conc, lab_conc, name):
+            for j in range(0, len(fea_chunked)):
+                fea_conc.append(fea_chunked[j])
+                lab_conc.append(lab_chunked[j])
+                if len(fea_chunked) > 1:
+                    snt_name.append(name+'_split'+str(j))
+                else:
+                    snt_name.append(k)
+            return fea_conc, lab_conc
+        def _chunk(max_sequence_length, fea, lab, fea_only):
+            def _chunk_by_input_and_output_chunk_config(chunk_config, fea, lab, fea_only):
+                ''' 
+                If the sequence length is above the threshold, we split it with a minimal length max/4
+                If max length = 500, then the split will start at 500 + (500/4) = 625. 
+                A seq of length 625 will be splitted in one of 500 and one of 125
+                '''
+                chunk_size_fea, chunk_step_fea, chunk_size_lab, chunk_step_lab = chunk_config['chunk_size_fea'], chunk_config['chunk_step_fea'], chunk_config['chunk_size_lab'], chunk_config['chunk_step_lab']
+                fea_chunked = list()
+                lab_chunked = list()
+                split_threshold_fea = chunk_size_fea + (chunk_size_fea/4)
+                if(len(fea) > chunk_size_fea) and chunk_size_fea>0:
+                    nr_of_chunks = (len(fea) + chunk_size_fea - 1) // chunk_size_fea
+                    for i in range(nr_of_chunks):
+                        chunk_start_fea = i * chunk_step_fea
+                        if(len(fea[chunk_start_fea:]) > split_threshold_fea):
+                            chunk_end_fea = chunk_start_fea + chunk_size_fea
+                            fea_chunk = fea[chunk_start_fea:chunk_end_fea]
+                            if not fea_only:
+                                chunk_start_lab = i * chunk_step_lab
+                                chunk_end_lab = chunk_start_lab + chunk_size_lab
+                                lab_chunk = lab[chunk_start_lab:chunk_end_lab]
+                            else:
+                                lab_chunk = np.zeros((fea_chunk.shape[0],))
+                            fea_chunked.append(fea_chunk)
+                            lab_chunked.append(lab_chunk)
+                        else:
+                            fea_chunk = fea[chunk_start_fea:]
+                            if not fea_only:
+                                chunk_start_lab = i * chunk_step_lab
+                                lab_chunk = lab[chunk_start_lab:]
+                            else:
+                                lab_chunk = np.zeros((fea_chunk.shape[0],))
+                            lab_chunked.append(lab_chunk)
+                            fea_chunked.append(fea_chunk)
+                            break
+                else:
+                    fea_chunked.append(fea)
+                    if not fea_only:
+                      lab_chunked.append(lab)
+                    else:
+                      lab_chunked.append(np.zeros((fea.shape[0],)))
+                return fea_chunked, lab_chunked
+           
+            chunk_config = dict()
+            if type(max_sequence_length) == dict:
+                chunk_config['chunk_size_fea'] = max_sequence_length['chunk_size_fea']
+                chunk_config['chunk_step_fea'] = max_sequence_length['chunk_step_fea']
+                chunk_config['chunk_size_lab'] = max_sequence_length['chunk_size_lab']
+                chunk_config['chunk_step_lab'] = max_sequence_length['chunk_step_lab']
+            elif type(max_sequence_length) == int:
+                chunk_config['chunk_size_fea'] = max_sequence_length
+                chunk_config['chunk_step_fea'] = max_sequence_length
+                chunk_config['chunk_size_lab'] = max_sequence_length
+                chunk_config['chunk_step_lab'] = max_sequence_length
             else:
-              fea_chunked.append(fea[k][i * max_sequence_length:])
-              if not fea_only:
-                lab_chunked.append(lab[k][i * max_sequence_length:])
-              else:
-                lab_chunked.append(np.zeros((fea[k][i * max_sequence_length:].shape[0],)))
-              break
+                raise ValueError('Unknown type of max_sequence_length')
+            return _chunk_by_input_and_output_chunk_config(chunk_config, fea, lab, fea_only)
 
-          for j in range(0, len(fea_chunked)):
-            fea_conc.append(fea_chunked[j])
-            lab_conc.append(lab_chunked[j])
-            snt_name.append(k+'_split'+str(j))
-            
-        else:
-          fea_conc.append(fea[k])
-          if not fea_only:
-            lab_conc.append(lab[k])
-          else:
-            lab_conc.append(np.zeros((fea[k].shape[0],)))
-          snt_name.append(k)
+        snt_name = list()
+        fea_conc = list()
+        lab_conc = list()
+        feature_keys_soted_by_sequence_length = sorted(sorted(fea.keys()), key=lambda k: len(fea[k]))
+        for k in feature_keys_soted_by_sequence_length:
+            fea_el = fea[k]
+            lab_el = None
+            if not fea_only:
+                lab_el = lab[k]
+            fea_chunked, lab_chunked = _chunk(max_sequence_length, fea_el, lab_el, fea_only)
+            fea_conc, lab_conc = _append_to_concat_list(fea_chunked, lab_chunked, fea_conc, lab_conc, k)
+        return fea_conc, lab_conc, snt_name
+    def _concatenate_features_and_labels(fea_conc, lab_conc):
+        def _sort_chunks_by_length(fea_conc, lab_conc):
+            fea_zipped = zip(fea_conc,lab_conc)
+            fea_sorted = sorted(fea_zipped, key=lambda x: x[0].shape[0])
+            fea_conc,lab_conc = zip(*fea_sorted)
+            return fea_conc, lab_conc
+        def _get_end_index_from_list(conc):
+            end_snt=0
+            end_index=list()
+            for entry in conc:
+                end_snt=end_snt+entry.shape[0]
+                end_index.append(end_snt)
+            return end_index
 
-        tmp+=1
+        fea_conc, lab_conc = _sort_chunks_by_length(fea_conc, lab_conc)
+        end_index_fea = _get_end_index_from_list(fea_conc)
+        end_index_lab = _get_end_index_from_list(lab_conc)
+        fea_conc=np.concatenate(fea_conc)
+        lab_conc=np.concatenate(lab_conc)
+        return fea_conc, lab_conc, end_index_fea, end_index_lab
+    def _match_feature_and_label_sequence_lengths(fea, lab, max_sequence_length):
+        ALLOW_FRAME_DIFF_LARGER_ONE = False
+        def _adjust_feature_sequence_length(fea, nr_of_fea_for_lab):
+            nr_of_fea = fea.shape[0]
+            if nr_of_fea > nr_of_fea_for_lab:
+                fea_adj = np.take(fea, range(nr_of_fea_for_lab), axis=0)
+            elif nr_of_fea < nr_of_fea_for_lab:
+                padding = np.zeros(shape=(nr_of_fea_for_lab-nr_of_fea,) + fea.shape[1:])
+                fea_adj = np.concatenate([fea, padding], axis=0)
+            else:
+                fea_adj = fea
+            return fea_adj
+        chunk_size_fea = max_sequence_length['chunk_size_fea']
+        chunk_step_fea = max_sequence_length['chunk_step_fea']
+        chunk_size_lab = max_sequence_length['chunk_size_lab']
+        chunk_step_lab = max_sequence_length['chunk_step_lab']
+        window_shift = max_sequence_length['window_shift']
+        window_size = max_sequence_length['window_size']
+        for k in fea.keys():
+            nr_of_fea = fea[k].shape[0]
+            nr_of_lab = lab[k].shape[0]
+            nr_of_fea_for_lab = (nr_of_lab - 1) * window_shift + window_size
+            if abs(nr_of_fea - nr_of_fea_for_lab) > window_shift and not ALLOW_FRAME_DIFF_LARGER_ONE:
+               raise ValueError('Nr. of features: ' + str(nr_of_fea) + ' does not match nr. of labels: ' + str(nr_of_lab) + ' with expected nr. of features: ' + str(nr_of_fea_for_lab))
+            fea[k] = _adjust_feature_sequence_length(fea[k], nr_of_fea_for_lab)
+        return fea, lab
 
-    fea_zipped = zip(fea_conc,lab_conc)
-    fea_sorted = sorted(fea_zipped, key=lambda x: x[0].shape[0])
-    fea_conc,lab_conc = zip(*fea_sorted)
-      
-    for entry in fea_conc:
-      end_snt=end_snt+entry.shape[0]
-      end_index.append(end_snt)
-
-    fea_conc=np.concatenate(fea_conc)
-    lab_conc=np.concatenate(lab_conc)
-
-    return [snt_name,fea_conc,lab_conc,np.asarray(end_index)] 
+    fea, lab = _read_features_and_labels_with_kaldi(fea_scp, fea_opts, fea_only, lab_folder, lab_opts, output_folder)
+    if _input_is_wav_file(fea_scp) and (not fea_only):
+        fea, lab = _match_feature_and_label_sequence_lengths(fea, lab, max_sequence_length)
+    fea_chunks, lab_chunks, chunk_names = _chunk_features_and_labels(max_sequence_length, fea, lab, fea_only, _input_is_wav_file(fea_scp))
+    fea_conc, lab_conc, end_index_fea, end_index_lab = _concatenate_features_and_labels(fea_chunks, lab_chunks)
+    return [chunk_names,fea_conc,lab_conc,np.asarray(end_index_fea),np.asarray(end_index_lab)] 
 
 
 def context_window_old(fea,left,right):
@@ -120,14 +206,16 @@ def context_window(fea,left,right):
 def load_chunk(fea_scp,fea_opts,lab_folder,lab_opts,left,right,max_sequence_length, output_folder,fea_only=False):
   
   # open the file
-  [data_name,data_set,data_lab,end_index]=load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only)
+  [data_name,data_set,data_lab,end_index_fea,end_index_lab]=load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only)
+
+  # TODO: currently end_index_lab is ignored
 
   # Context window
   if left!=0 or right!=0:
       data_set=context_window(data_set,left,right)
 
-  end_index=end_index-left
-  end_index[-1]=end_index[-1]-right
+  end_index_fea=end_index_fea-left
+  end_index_fea[-1]=end_index_fea[-1]-right
 
   # mean and variance normalization
   data_set=(data_set-np.mean(data_set,axis=0))/np.std(data_set,axis=0)
@@ -141,13 +229,181 @@ def load_chunk(fea_scp,fea_opts,lab_folder,lab_opts,left,right,max_sequence_leng
   
   data_set=np.column_stack((data_set, data_lab))
 
-  return [data_name,data_set,end_index]
+  return [data_name,data_set,end_index_fea]
 
 def load_counts(class_counts_file):
     with open(class_counts_file) as f:
         row = next(f).strip().strip('[]').strip()
         counts = np.array([ np.float32(v) for v in row.split() ])
     return counts 
+
+def read_lab_fea_refac01(cfg_file, fea_only, shared_list, output_folder):
+    def _read_chunk_specific_config(cfg_file):
+        if not(os.path.exists(cfg_file)):
+            sys.stderr.write('ERROR: The config file %s does not exist!\n'%(cfg_file))
+            sys.exit(0)
+        else:
+            config = configparser.ConfigParser()
+            config.read(cfg_file)
+        return config
+    def _read_from_config(config, fea_only):
+        def _get_max_seq_length_from_config_str(config_str):
+            max_seq_length=[int(e) for e in config_str.split(',')]
+            if len(max_seq_length) == 1:
+                max_seq_length = max_seq_length[0]
+            else:
+                assert len(max_seq_length) == 6
+                max_seq_length_list = max_seq_length
+                max_seq_length = dict()
+                max_seq_length['chunk_size_fea'] = max_seq_length_list[0]
+                max_seq_length['chunk_step_fea'] = max_seq_length_list[1]
+                max_seq_length['chunk_size_lab'] = max_seq_length_list[2]
+                max_seq_length['chunk_step_lab'] = max_seq_length_list[3]
+                max_seq_length['window_shift'] = max_seq_length_list[4]
+                max_seq_length['window_size'] = max_seq_length_list[5]
+            return max_seq_length
+        
+        to_do=config['exp']['to_do']
+        if to_do=='train':
+            max_seq_length=_get_max_seq_length_from_config_str(config['batches']['max_seq_length_train'])
+        if to_do=='valid':
+            max_seq_length=_get_max_seq_length_from_config_str(config['batches']['max_seq_length_valid'])
+        if to_do=='forward':
+            max_seq_length=-1 # do to break forward sentences
+            fea_only=True
+        fea_dict, lab_dict, arch_dict = dict_fea_lab_arch(config, fea_only)
+        seq_model = is_sequential_dict(config, arch_dict)
+        return to_do, max_seq_length, fea_dict, lab_dict, arch_dict, seq_model
+    def _read_features_and_labels(fea_dict, lab_dict, max_seq_length, fea_only, output_folder):
+        def _get_fea_config_from_dict(fea_dict_entr):
+            fea_scp = fea_dict_entr[1]
+            fea_opts = fea_dict_entr[2]
+            cw_left = int(fea_dict_entr[3])
+            cw_right = int(fea_dict_entr[4])
+            return fea_scp, fea_opts, cw_left, cw_right
+        def _get_lab_config_from_dict(lab_dict_entr, fea_only):
+            if fea_only:
+                lab_folder = None 
+                lab_opts = None
+            else:
+                lab_folder = lab_dict_entr[1]
+                lab_opts = lab_dict_entr[2]
+            return lab_folder, lab_opts
+        def _compensate_for_different_context_windows(data_set_fea, data_set_lab, cw_left_max, cw_left, cw_right_max, cw_right, data_end_index_fea, data_end_index_lab):
+            data_set_lab = np.take(data_set_lab, range(cw_left_max-cw_left,data_set_lab.shape[0]-(cw_right_max-cw_right)), axis=0, mode='clip')
+            data_set_fea = np.take(data_set_fea, range(cw_left_max-cw_left,data_set_fea.shape[0]-(cw_right_max-cw_right)), axis=0, mode='clip')
+            data_end_index_fea = data_end_index_fea - (cw_left_max - cw_left)
+            data_end_index_lab = data_end_index_lab - (cw_left_max - cw_left)
+            data_end_index_fea[-1] = data_end_index_fea[-1] - (cw_right_max - cw_right)
+            data_end_index_lab[-1] = data_end_index_lab[-1] - (cw_right_max - cw_right)
+            return data_set_lab, data_set_fea, data_end_index_fea, data_end_index_lab
+        def _update_data(data_set, labs, fea_dict, fea, fea_index, data_set_fea, labs_fea, cnt_fea, cnt_lab):
+            if cnt_fea==0 and cnt_lab==0:
+                data_set=data_set_fea
+                labs=labs_fea
+                fea_dict[fea].append(fea_index)
+                fea_index=fea_index+data_set_fea.shape[1]
+                fea_dict[fea].append(fea_index)
+                fea_dict[fea].append(fea_dict[fea][6]-fea_dict[fea][5])
+            elif cnt_fea==0 and (not cnt_fea==0):
+                labs=np.column_stack((labs,labs_fea))
+            elif (not cnt_fea==0) and cnt_fea==0:
+                data_set=np.column_stack((data_set,data_set_fea))
+                fea_dict[fea].append(fea_index)
+                fea_index=fea_index+data_set_fea.shape[1]
+                fea_dict[fea].append(fea_index)
+                fea_dict[fea].append(fea_dict[fea][6]-fea_dict[fea][5])
+            return data_set, labs, fea_dict, fea_index
+        def _check_consistency(data_name, data_name_fea, data_end_index_fea_ini, data_end_index_fea, data_end_index_lab_ini, data_end_index_lab):
+            if not (data_name == data_name_fea):
+                sys.stderr.write('ERROR: different sentence ids are detected for the different features. Plase check again input feature lists"\n')
+                sys.exit(0)
+            if not (data_end_index_fea_ini == data_end_index_fea).all():
+                sys.stderr.write('ERROR end_index must be the same for all the sentences"\n')
+                sys.exit(0)
+            if not (data_end_index_lab_ini == data_end_index_lab).all():
+                sys.stderr.write('ERROR end_index must be the same for all the sentences"\n')
+                sys.exit(0)
+        def _update_lab_dict(lab_dict, data_set):
+            cnt_lab=0
+            for lab in lab_dict.keys():
+                lab_dict[lab].append(data_set.shape[1]+cnt_lab)
+                cnt_lab=cnt_lab+1
+            return lab_dict
+        def _load_chunk_refac01(fea_scp,fea_opts,lab_folder,lab_opts,left,right,max_sequence_length, output_folder,fea_only=False):
+            [data_name,data_set,data_lab,end_index_fea,end_index_lab]=load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only)
+            # TODO: this function will currently only work well if no context window is given or fea and lab have the same time dimensionality
+            # Context window
+            if left!=0 or right!=0:
+                data_set=context_window(data_set,left,right)
+            end_index_fea = end_index_fea - left
+            end_index_lab = end_index_lab - left
+            end_index_fea[-1] = end_index_fea[-1] - right
+            end_index_lab[-1] = end_index_lab[-1] - right
+            # mean and variance normalization
+            data_set=(data_set-np.mean(data_set,axis=0))/np.std(data_set,axis=0)
+            # Label processing
+            data_lab=data_lab-data_lab.min()
+            if right>0:
+                data_lab=data_lab[left:-right]
+            else:
+                data_lab=data_lab[left:]   
+            if len(data_set.shape) == 1:
+                data_set = np.expand_dims(data_set, -1)
+            return [data_name, data_set, data_lab, end_index_fea, end_index_lab]
+        
+        cw_left_max, cw_right_max = compute_cw_max(fea_dict)
+        fea_index=0
+        cnt_fea=0
+        data_name = None 
+        data_end_index_fea_ini = None 
+        data_end_index_lab_ini = None 
+        data_set = None
+        labs = None
+        for fea in fea_dict.keys():
+            fea_scp, fea_opts, cw_left, cw_right = _get_fea_config_from_dict(fea_dict[fea])
+            cnt_lab=0
+            if fea_only:
+                lab_dict.update({'lab_name':'none'})
+            for lab in lab_dict.keys():
+                lab_folder, lab_opts = _get_lab_config_from_dict(lab_dict[lab], fea_only)
+                data_name_fea, data_set_fea, data_set_lab, data_end_index_fea, data_end_index_lab = _load_chunk_refac01(fea_scp, fea_opts, lab_folder, lab_opts, cw_left, cw_right, max_seq_length, output_folder, fea_only)
+                labs_fea, data_set_fea, data_end_index_fea, data_end_index_lab = _compensate_for_different_context_windows(data_set_fea, data_set_lab, cw_left_max, cw_left, cw_right_max, cw_right, data_end_index_fea, data_end_index_lab)
+                if cnt_fea == 0 and cnt_lab == 0:
+                    data_end_index_fea_ini = data_end_index_fea
+                    data_end_index_lab_ini = data_end_index_lab
+                    data_name = data_name_fea
+                data_set, labs, fea_dict, fea_index = _update_data(data_set, labs, fea_dict, fea, fea_index, data_set_fea, labs_fea, cnt_fea, cnt_lab)
+                _check_consistency(data_name, data_name_fea, data_end_index_fea_ini, data_end_index_fea, data_end_index_lab_ini, data_end_index_lab)
+                cnt_lab=cnt_lab+1
+            cnt_fea=cnt_fea+1
+        if not fea_only:
+            lab_dict = _update_lab_dict(lab_dict, data_set)
+        return data_name, data_end_index_fea_ini, data_end_index_lab_ini, fea_dict, lab_dict, data_set, labs
+    def _reorder_data_set(data_set, labs, seq_model, to_do):
+        if not(seq_model) and to_do != 'forward' and (data_set.shape[0] == labs.shape[0]):
+            data_set_shape = data_set.shape[1]
+            data_set_joint = np.column_stack((data_set,labs))
+            np.random.shuffle(data_set)
+            data_set = data_set_joint[:, :data_set_shape]
+            labs = np.squeeze(data_set_joint[:, data_set_shape:], axis=-1)
+        return data_set, labs
+    def _append_to_shared_list(shared_list, data_name, data_end_index_fea, data_end_index_lab, fea_dict, lab_dict, arch_dict, data_set):
+        shared_list.append(data_name)
+        shared_list.append(data_end_index_fea)
+        shared_list.append(data_end_index_lab)
+        shared_list.append(fea_dict)
+        shared_list.append(lab_dict)
+        shared_list.append(arch_dict)
+        shared_list.append(data_set)
+        return shared_list
+
+    config = _read_chunk_specific_config(cfg_file)
+    to_do, max_seq_length, fea_dict, lab_dict, arch_dict, seq_model = _read_from_config(config, fea_only)
+    data_name, data_end_index_fea, data_end_index_lab, fea_dict, lab_dict, data_set, labs = _read_features_and_labels(fea_dict, lab_dict, max_seq_length, fea_only, output_folder)
+    data_set, labs = _reorder_data_set(data_set, labs, seq_model, to_do)
+    data_set = {'input': data_set, 'ref': labs}
+    shared_list = _append_to_shared_list(shared_list, data_name, data_end_index_fea, data_end_index_lab, fea_dict, lab_dict, arch_dict, data_set)
 
 def read_lab_fea(cfg_file,fea_only,shared_list,output_folder):
     
@@ -172,14 +428,11 @@ def read_lab_fea(cfg_file,fea_only,shared_list,output_folder):
     if to_do=='forward':
         max_seq_length=-1 # do to break forward sentences
     
-    
-    [fea_dict,lab_dict,arch_dict]=dict_fea_lab_arch(config)
-    
+    [fea_dict,lab_dict,arch_dict]=dict_fea_lab_arch(config,fea_only)
     [cw_left_max,cw_right_max]=compute_cw_max(fea_dict)
     
     fea_index=0
     cnt_fea=0
-
     for fea in fea_dict.keys():
         
         # reading the features
@@ -193,9 +446,7 @@ def read_lab_fea(cfg_file,fea_only,shared_list,output_folder):
         # Production case, we don't have labels (lab_name = none)
         if fea_only:
           lab_dict.update({'lab_name':'none'})
-
         for lab in lab_dict.keys():
-            
             # Production case, we don't have labels (lab_name = none)
             if fea_only:
               lab_folder=None 
@@ -498,7 +749,7 @@ def read_vec_flt_scp(file_or_fd,output_folder):
   try:
     for line in fd:
       (key,rxfile) = line.decode().split(' ')
-      vec = read_vec_flt(rxfile)
+      vec = read_vec_flt(rxfile,output_folder)
       yield key, vec
   finally:
     if fd is not file_or_fd : fd.close()
@@ -515,7 +766,7 @@ def read_vec_flt_ark(file_or_fd,output_folder):
   try:
     key = read_key(fd)
     while key:
-      ali = read_vec_flt(fd)
+      ali = read_vec_flt(fd,output_folder)
       yield key, ali
       key = read_key(fd)
   finally:
@@ -529,6 +780,8 @@ def read_vec_flt(file_or_fd,output_folder):
   binary = fd.read(2).decode()
   if binary == '\0B': # binary flag
     return _read_vec_flt_binary(fd)
+  elif binary == 'RI':
+    return _read_vec_flt_riff(fd)
   else:  # ascii,
     arr = (binary + fd.readline().decode()).strip().split()
     try:
@@ -538,6 +791,26 @@ def read_vec_flt(file_or_fd,output_folder):
     ans = np.array(arr, dtype=float)
   if fd is not file_or_fd : fd.close() # cleanup
   return ans
+
+def _read_vec_flt_riff(fd):
+    RIFF_CHUNK_DESCR_HEADER_SIZE = 12
+    ALREADY_READ_HEADER_BYTES = 2
+    SUB_CHUNK_HEADER_SIZE = 8
+    DATA_CHUNK_HEADER_SIZE = 8
+    def pcm2float(signal, dtype='float32'):
+        signal = np.asarray(signal)
+        dtype = np.dtype(dtype)
+        return signal.astype(dtype) / dtype.type(-np.iinfo(signal.dtype).min)
+
+    import struct
+    header = fd.read(RIFF_CHUNK_DESCR_HEADER_SIZE - ALREADY_READ_HEADER_BYTES)
+    assert header[:2] == b'FF'
+    chunk_header = fd.read(SUB_CHUNK_HEADER_SIZE)
+    subchunk_id, subchunk_size = struct.unpack('<4sI', chunk_header)
+    aformat, channels, samplerate, byterate, block_align, bps = struct.unpack('HHIIHH', fd.read(subchunk_size))
+    subchunk2_id, subchunk2_size = struct.unpack('<4sI', fd.read(DATA_CHUNK_HEADER_SIZE))
+    pcm_data = np.frombuffer(fd.read(subchunk2_size), dtype='int' + str(bps))
+    return pcm2float(pcm_data)
 
 def _read_vec_flt_binary(fd):
   header = fd.read(3).decode()
@@ -556,7 +829,6 @@ def _read_vec_flt_binary(fd):
   elif sample_size == 8 : ans = np.frombuffer(buf, dtype='float64')
   else : raise BadSampleSize
   return ans
-
 
 # Writing,
 def write_vec_flt(file_or_fd, output_folder, v, key=''):
@@ -630,7 +902,6 @@ def read_mat_ark(file_or_fd,output_folder):
    Read ark to a 'dictionary':
    d = { key:mat for key,mat in kaldi_io.read_mat_ark(file) }
   """
-
 
   fd = open_or_fd(file_or_fd,output_folder)
   try:

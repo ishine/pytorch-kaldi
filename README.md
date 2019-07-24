@@ -23,6 +23,9 @@ To improve transparency and replicability of speech recognition results, we give
 
 [See a short introductory video on the PyTorch-Kaldi Toolkit](https://www.youtube.com/watch?v=VDQaf0SS4K0&t=2s)
 
+## Next Version
+We are actively working on the next version of PyTorch-Kaldi (v0.3). The architecture of the toolkit will be more modular and flexible. Beyond speech recognition, the new toolkit will be suitable for other applications such as speaker recognition, speech enhancement, speech separation, etc.
+The toolkit will support labels and features in many different formats (not just the current kaldi one) and will be much easier feeding the system with the raw samples directly. The toolkit will support a number of data processing functions, including data augmentation and contamination. We are also working to support self-supervised training.  
 
 ## Table of Contents
 * [Introduction](#introduction)
@@ -230,6 +233,7 @@ There are some examples with recurrent (TIMIT_RNN*,TIMIT_LSTM*,TIMIT_GRU*,TIMIT_
 |  Kaldi DNN Baseline | -----| ------| 18.5 |
 |  MLP  | 18.2 | 18.7 | 16.7 | 
 |  RNN  | 17.7 | 17.2 | 15.9 | 
+|  SRU  | -----| 16.6 | -----|
 |LSTM| 15.1  | 14.3  |14.5  | 
 |GRU| 16.0 | 15.2|  14.9 | 
 |li-GRU| **15.5**  | **14.9**|  **14.2** | 
@@ -238,42 +242,52 @@ Results show that, as expected, fMLLR features outperform MFCCs and FBANKs coeff
 
 The best results are actually obtained with a more complex architecture that combines MFCC, FBANK, and fMLLR features (see *cfg/TIMI_baselines/TIMIT_mfcc_fbank_fmllr_liGRU_best.cfg*). To the best of our knowledge, the **PER=13.8\%** achieved by the latter system yields the best-published performance on the TIMIT test-set. 
 
+The Simple Recurrent Units (SRU) is an efficient and highly parallelizable recurrent model. Its performance on ASR is worse than standard LSTM, GRU, and Li-GRU models, but it is significantly faster. SRU is implemented [here](https://github.com/taolei87/sru) and described in the following paper:
+
+T. Lei, Y. Zhang, S. I. Wang, H. Dai, Y. Artzi, "Simple Recurrent Units for Highly Parallelizable Recurrence, Proc. of EMNLP 2018. [arXiv](https://arxiv.org/pdf/1709.02755.pdf)
+
+To do experiments with this model, use the config file *cfg/TIMIT_baselines/TIMIT_SRU_fbank.cfg*. Before you should install the model using ```pip install sru``` and you should uncomment "import sru" in *neural_networks.py*.
+
+
 You can directly compare your results with ours by going [here](https://bitbucket.org/mravanelli/pytorch-kaldi-exp-timit/src/master/). In this external repository, you can find all the folders containing the generated files.
 
 ## Librispeech tutorial
 The steps to run PyTorch-Kaldi on the Librispeech dataset are similar to that reported above for TIMIT. The following tutorial is based on the *100h sub-set*, but it can be easily extended to the full dataset (960h).
 
-1. Run the Kaldi recipe for librispeech at least until "# decode using the tri4b model" (included)
-
-2. Compute the fmllr features by running:
+1. Run the Kaldi recipe for librispeech at least until Stage 13 (included)
+2. Copy exp/tri4b/trans.* files into exp/tri4b/decode_tgsmall_train_clean_100/
+```
+mkdir exp/tri4b/decode_tgsmall_train_clean_100 && cp exp/tri4b/trans.* exp/tri4b/decode_tgsmall_train_clean_100/
+```
+3. Compute the fmllr features by running the following script. 
 
 ```
 . ./cmd.sh ## You'll want to change cmd.sh to something that will work on your system.
 . ./path.sh ## Source the tools/utils (import the queue.pl)
 
-chunk=train_clean_100
-#chunk=dev_clean # Uncomment to process dev
-#chunk=test_clean # Uncomment to process test
 gmmdir=exp/tri4b
 
-dir=fmllr/$chunk
-steps/nnet/make_fmllr_feats.sh --nj 10 --cmd "$train_cmd" \
-    --transform-dir $gmmdir/decode_tgsmall_$chunk \
-        $dir data/$chunk $gmmdir $dir/log $dir/data || exit 1
-        
-compute-cmvn-stats --spk2utt=ark:data/$chunk/spk2utt scp:fmllr/$chunk/feats.scp ark:$dir/data/cmvn_speaker.ark
+for chunk in train_clean_100 dev_clean test_clean; do
+    dir=fmllr/$chunk
+    steps/nnet/make_fmllr_feats.sh --nj 10 --cmd "$train_cmd" \
+        --transform-dir $gmmdir/decode_tgsmall_$chunk \
+            $dir data/$chunk $gmmdir $dir/log $dir/data || exit 1
+
+    compute-cmvn-stats --spk2utt=ark:data/$chunk/spk2utt scp:fmllr/$chunk/feats.scp ark:$dir/data/cmvn_speaker.ark
+done
 ```
 
-3. compute aligmenents using:
+4. compute aligmenents using:
 ```
 # aligments on dev_clean and test_clean
+steps/align_fmllr.sh --nj 30 data/train_clean_100 data/lang exp/tri4b exp/tri4b_ali_clean_100
 steps/align_fmllr.sh --nj 10 data/dev_clean data/lang exp/tri4b exp/tri4b_ali_dev_clean_100
 steps/align_fmllr.sh --nj 10 data/test_clean data/lang exp/tri4b exp/tri4b_ali_test_clean_100
 ```
 
-4. run the experiments with the following command:
+5. run the experiments with the following command:
 ```
-  python run_exp.py cfg/Librispeech_baselines/libri_MLP_fmllr.cfg.
+  python run_exp.py cfg/Librispeech_baselines/libri_MLP_fmllr.cfg
 ```
 
 If you would like to use a recurrent model you can use *libri_RNN_fmllr.cfg*, *libri_LSTM_fmllr.cfg*, *libri_GRU_fmllr.cfg*, or *libri_liGRU_fmllr.cfg*. The training of recurrent models might take some days (depending on the adopted GPU).  The performance obtained with the tgsmall graph are reported in the following table:

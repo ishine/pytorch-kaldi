@@ -610,7 +610,7 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                         
                 else:
                     # Try to automatically retrieve the count file from the config file
-        
+                
                         
                     # Compute the number of context-dependent phone states    
                     if "ali-to-pdf" in lab_opts[lab_lst.index(forward_norm_lst[i])]:
@@ -621,7 +621,6 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                         if output.decode().rstrip()=='':
                             sys.stderr.write("ERROR: hmm-info command doesn't exist. Make sure your .bashrc contains the Kaldi paths and correctly exports it.\n")
                             sys.exit(0)
-
                         N_out=int(output.decode().rstrip())
                         N_out_lab[lab_lst.index(forward_norm_lst[i])]=N_out
                         count_file_path=out_folder+'/exp_files/forward_'+forward_out_lst[i]+'_'+forward_norm_lst[i]+'.count'
@@ -688,6 +687,77 @@ def split_chunks(seq, size):
                 newseq.append(seq[int(round(i*splitsize)):int(round((i+1)*splitsize))])
         return newseq
 
+def get_chunks_after_which_to_validate(N_ck_tr, nr_of_valid_per_epoch):
+    def _partition_chunks(N_ck_tr, nr_of_valid_per_epoch):
+        chunk_part = list()
+        chunk_size = int(np.ceil(N_ck_tr / float(nr_of_valid_per_epoch)))
+        for i1 in range(nr_of_valid_per_epoch):
+            chunk_part.append(range(0, N_ck_tr)[i1*chunk_size:(i1+1)*chunk_size])
+        return chunk_part
+
+    part_chunk_ids = _partition_chunks(N_ck_tr, nr_of_valid_per_epoch)
+    chunk_ids = list()
+    for l in part_chunk_ids:
+        chunk_ids.append(l[-1])
+    return chunk_ids
+
+def do_validation_after_chunk(ck, N_ck_tr, config):
+    def _get_nr_of_valid_per_epoch_from_config(config):
+        if not 'nr_of_valid_per_epoch' in config['exp']:
+            return 1
+        return int(config['exp']['nr_of_valid_per_epoch'])
+
+    nr_of_valid_per_epoch = _get_nr_of_valid_per_epoch_from_config(config) 
+    valid_chunks = get_chunks_after_which_to_validate(N_ck_tr, nr_of_valid_per_epoch)
+    if ck in valid_chunks:
+        return True
+    else:
+        return False
+
+def _get_val_file_name_base(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+    file_name = 'valid_' + dataset + '_ep' + format(ep, N_ep_str_format) + '_trCk' + format(ck, N_ck_str_format)
+    if ck_val is None:
+        file_name += '*'
+    else:
+        file_name += '_ck' + format(ck_val, N_ck_str_format_val)
+    
+    return file_name
+
+def get_val_lst_file_path(out_folder, valid_data, ep, ck, ck_val, fea_name, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+    def _get_val_lst_file_name(dataset, ep, ck, ck_val, fea_name, N_ep_str_format, N_ck_str_format, N_ck_str_format_val): 
+        file_name = _get_val_file_name_base(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+        file_name += '_'
+        if not fea_name is None:
+            file_name += fea_name
+        else:
+            file_name += '*'
+        file_name += '.lst'
+        return file_name
+    
+    lst_file_name = _get_val_lst_file_name(valid_data, ep, ck, ck_val, fea_name, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+    lst_file = out_folder+'/exp_files/' + lst_file_name
+    return lst_file
+
+def get_val_info_file_path(out_folder, valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+    def _get_val_info_file_name(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+        file_name = _get_val_file_name_base(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+        file_name += '.info'
+        return file_name
+
+    info_file_name = _get_val_info_file_name(valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+    info_file = out_folder+'/exp_files/' + info_file_name
+    return info_file
+
+def get_val_cfg_file_path(out_folder, valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+    def _get_val_cfg_file_name(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val):
+        file_name = _get_val_file_name_base(dataset, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+        file_name += '.cfg'
+        return file_name
+
+    cfg_file_name = _get_val_cfg_file_name(valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+    config_chunk_file = out_folder + '/exp_files/' + cfg_file_name
+    return config_chunk_file
+
 def create_configs(config):
     
     # This function create the chunk-specific config files
@@ -712,7 +782,10 @@ def create_configs(config):
     batch_size_tr_arr=expand_str_ep(batch_size_tr_str,'int',N_ep,'|','*')
     
     # Read the max_seq_length_train
-    max_seq_length_tr_arr=expand_str_ep(max_seq_length_train,'int',N_ep,'|','*')
+    if len(max_seq_length_train.split(',')) == 1:
+        max_seq_length_tr_arr=expand_str_ep(max_seq_length_train,'int',N_ep,'|','*')
+    else:
+        max_seq_length_tr_arr=[max_seq_length_train] * N_ep
 
 
     cfg_file_proto=config['cfg_proto']['cfg_proto']
@@ -760,7 +833,12 @@ def create_configs(config):
         
     
     if strtobool(config['batches']['increase_seq_length_train']):
-        max_seq_length_train_curr=int(config['batches']['start_seq_len_train'])
+        max_seq_length_train_curr = config['batches']['start_seq_len_train']
+        if len(max_seq_length_train.split(',')) == 1:
+            max_seq_length_train_curr=int(max_seq_length_train_curr)
+        else:
+            # TODO: add support for increasing seq length when fea and lab have different time dimensionality
+            pass
 
     for ep in range(N_ep):
         
@@ -792,7 +870,10 @@ def create_configs(config):
                 lst_chunk_file.write(config_chunk_file+'\n')
                 
                 if strtobool(config['batches']['increase_seq_length_train'])==False:
-                    max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
+                    if len(max_seq_length_train.split(',')) == 1:
+                        max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
+                    else:
+                        max_seq_length_train_curr=max_seq_length_tr_arr[ep]
                     
                 # Write chunk-specific cfg file
                 write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,'train',tr_data,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size_tr_arr[ep],drop_rates)
@@ -800,31 +881,24 @@ def create_configs(config):
                 # update pt_file (used to initialized the DNN for the next chunk)  
                 for pt_arch in pt_files.keys():
                     pt_files[pt_arch]=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+pt_arch+'.pkl'
-        
-        for valid_data in valid_data_lst:
-            
-            # Compute the number of chunks for each validation dataset
-            N_ck_valid=compute_n_chunks(out_folder,valid_data,ep,N_ep_str_format,'valid')
-            N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_valid)),1))+'d'
-        
-            for ck in range(N_ck_valid):
-                
-                # path of the list of features for this chunk
-                lst_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_*.lst'
-                
-                # paths of the output files
-                info_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'            
-                config_chunk_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
-                lst_chunk_file.write(config_chunk_file+'\n')
-                # Write chunk-specific cfg file
-                write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,model_files,lst_file,info_file,'valid',valid_data,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size_tr_arr[ep],drop_rates)
-    
-        #  if needed, update sentence_length
-        if strtobool(config['batches']['increase_seq_length_train']):
-            max_seq_length_train_curr=max_seq_length_train_curr*int(config['batches']['multply_factor_seq_len_train'])
-            if max_seq_length_train_curr>int(max_seq_length_tr_arr[ep]):
-                max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
-            
+                if do_validation_after_chunk(ck, N_ck_tr, config):
+                    for valid_data in valid_data_lst:
+                        N_ck_valid = compute_n_chunks(out_folder,valid_data,ep,N_ep_str_format,'valid')
+                        N_ck_str_format_val = '0'+str(max(math.ceil(np.log10(N_ck_valid)),1))+'d'
+                        for ck_val in range(N_ck_valid):
+                            lst_file = get_val_lst_file_path(out_folder, valid_data, ep, ck, ck_val, None, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+                            info_file = get_val_info_file_path(out_folder, valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+                            config_chunk_file = get_val_cfg_file_path(out_folder, valid_data, ep, ck, ck_val, N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+                            lst_chunk_file.write(config_chunk_file+'\n')
+                            write_cfg_chunk(cfg_file, config_chunk_file, cfg_file_proto_chunk, model_files, lst_file, info_file, 'valid', valid_data, lr, max_seq_length_train_curr, name_data, ep, ck_val, batch_size_tr_arr[ep], drop_rates)
+                    if strtobool(config['batches']['increase_seq_length_train']):
+                        if len(max_seq_length_train.split(',')) == 1:
+                            max_seq_length_train_curr=max_seq_length_train_curr*int(config['batches']['multply_factor_seq_len_train'])
+                            if max_seq_length_train_curr>int(max_seq_length_tr_arr[ep]):
+                                max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
+                        else:
+                            # TODO: add support for increasing seq length when fea and lab have different time dimensionality
+                            pass
         
     for forward_data in forward_data_lst:
                
@@ -849,6 +923,17 @@ def create_configs(config):
                     
                     
 def create_lists(config):
+    def _get_validation_data_for_chunks(fea_names, list_fea, N_chunks): 
+        full_list=[]
+        for i in range(len(fea_names)):
+            full_list.append([line.rstrip('\n')+',' for line in open(list_fea[i])])
+            full_list[i]=sorted(full_list[i])
+        full_list_fea_conc=full_list[0]
+        for i in range(1,len(full_list)):  
+            full_list_fea_conc=list(map(str.__add__,full_list_fea_conc,full_list[i]))
+        random.shuffle(full_list_fea_conc)
+        valid_chunks_fea=list(split_chunks(full_list_fea_conc,N_chunks))
+        return valid_chunks_fea
     
     # splitting data into chunks (see out_folder/additional_files)
     out_folder=config['exp']['out_folder']
@@ -896,57 +981,29 @@ def create_lists(config):
                     for snt in tr_chunks_fea[ck]:
                         #print(snt.split(',')[i])
                         tr_chunks_fea_split.append(snt.split(',')[i])
-                        
                     output_lst_file=out_folder+'/exp_files/train_'+dataset+'_ep'+format(ep,  N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+fea_names[i]+'.lst'
                     f=open(output_lst_file,'w')
                     tr_chunks_fea_wr=map(lambda x:x+'\n', tr_chunks_fea_split)
                     f.writelines(tr_chunks_fea_wr)
                     f.close()
-    
-            
-    # Validation chunk lists creation    
-    valid_data_name=config['data_use']['valid_with'].split(',')
-    
-    # Reading validation feature lists
-    for dataset in valid_data_name:
-        sec_data=cfg_item2sec(config,'data_name',dataset)
-        [fea_names,list_fea,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',dataset)]['fea'])
-
-        N_chunks= int(config[sec_data]['N_chunks'])
-        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_chunks)),1))+'d'
-        
-        full_list=[]
-        
-        for i in range(len(fea_names)):
-            full_list.append([line.rstrip('\n')+',' for line in open(list_fea[i])])
-            full_list[i]=sorted(full_list[i])
-          
-
-        # concatenating all the featues in a single file (useful for shuffling consistently)
-        full_list_fea_conc=full_list[0]
-        for i in range(1,len(full_list)):  
-            full_list_fea_conc=list(map(str.__add__,full_list_fea_conc,full_list[i]))
-         
-        # randomize the list
-        random.shuffle(full_list_fea_conc)
-        valid_chunks_fea=list(split_chunks(full_list_fea_conc,N_chunks))
-
-        
-        for ep in range(N_ep):
-            for ck in range(N_chunks):
-                for i in range(len(fea_names)):
-                    
-                    valid_chunks_fea_split=[];
-                    for snt in valid_chunks_fea[ck]:
-                        #print(snt.split(',')[i])
-                        valid_chunks_fea_split.append(snt.split(',')[i])
-                        
-                    output_lst_file=out_folder+'/exp_files/valid_'+dataset+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+fea_names[i]+'.lst'
-                    f=open(output_lst_file,'w')
-                    valid_chunks_fea_wr=map(lambda x:x+'\n', valid_chunks_fea_split)
-                    f.writelines(valid_chunks_fea_wr)
-                    f.close()
-                    
+                if do_validation_after_chunk(ck, N_chunks, config):
+                    valid_data_name=config['data_use']['valid_with'].split(',')
+                    for dataset_val in valid_data_name:
+                        sec_data = cfg_item2sec(config,'data_name',dataset_val)
+                        fea_names, list_fea, fea_opts, cws_left, cws_right = parse_fea_field(config[cfg_item2sec(config,'data_name',dataset_val)]['fea'])
+                        N_chunks_val = int(config[sec_data]['N_chunks'])
+                        N_ck_str_format_val = '0'+str(max(math.ceil(np.log10(N_chunks_val)),1))+'d'
+                        valid_chunks_fea = _get_validation_data_for_chunks(fea_names, list_fea, N_chunks_val)
+                        for ck_val in range(N_chunks_val):
+                            for fea_idx in range(len(fea_names)):
+                                valid_chunks_fea_split=[];
+                                for snt in valid_chunks_fea[ck_val]:
+                                    valid_chunks_fea_split.append(snt.split(',')[fea_idx])
+                                output_lst_file = get_val_lst_file_path(out_folder, dataset_val, ep, ck, ck_val, fea_names[fea_idx], N_ep_str_format, N_ck_str_format, N_ck_str_format_val)
+                                f=open(output_lst_file,'w')
+                                valid_chunks_fea_wr=map(lambda x:x+'\n', valid_chunks_fea_split)
+                                f.writelines(valid_chunks_fea_wr)
+                                f.close()
                     
     # forward chunk lists creation    
     forward_data_name=config['data_use']['forward_with'].split(',')
@@ -1529,12 +1586,11 @@ def list_fea_lab_arch(config): # cancel
 
 
 
-def dict_fea_lab_arch(config):
+def dict_fea_lab_arch(config, fea_only):
     model=config['model']['model'].split('\n')
     fea_lst=list(re.findall('fea_name=(.*)\n',config['data_chunk']['fea'].replace(' ','')))
     lab_lst=list(re.findall('lab_name=(.*)\n',config['data_chunk']['lab'].replace(' ','')))
 
-    
     fea_lst_used=[]
     lab_lst_used=[]
     arch_lst_used=[]
@@ -1578,7 +1634,7 @@ def dict_fea_lab_arch(config):
                 
             
             fea_lst_used_name.append(inp2)
-        if inp1 in lab_lst and inp1 not in lab_lst_used_name:
+        if inp1 in lab_lst and inp1 not in lab_lst_used_name and not fea_only:
             pattern_lab="lab_name="+inp1+"\nlab_folder=(.*)\nlab_opts=(.*)"
             
             if sys.version_info[0]==2:
@@ -1589,10 +1645,10 @@ def dict_fea_lab_arch(config):
                 lab_dict_used[inp1]=(inp1+","+",".join(list(re.findall(pattern_lab,lab_field)[0]))).split(',')
             
             lab_lst_used_name.append(inp1)
-            
-        if inp2 in lab_lst and inp2 not in lab_lst_used_name:
+        
+        if inp2 in lab_lst and inp2 not in lab_lst_used_name and not fea_only:
+            # Testing production case (no labels)
             pattern_lab="lab_name="+inp2+"\nlab_folder=(.*)\nlab_opts=(.*)"
-            
             if sys.version_info[0]==2:
                 lab_lst_used.append((inp2+","+",".join(list(re.findall(pattern_lab,lab_field)[0]))).encode('utf8').split(','))
                 lab_dict_used[inp2]=(inp2+","+",".join(list(re.findall(pattern_lab,lab_field)[0]))).encode('utf8').split(',')
@@ -1688,15 +1744,11 @@ def model_init(inp_out_dict,model,config,arch_dict,use_cuda,multi_gpu,to_do):
             
             # initialize the neural network
             net=nn_class(config[arch_dict[inp1][0]],inp_dim)
-    
-    
             
             if use_cuda:
                 net.cuda()
-                if multi_gpu:
-                    net = nn.DataParallel(net)
-                    
-            
+
+
             if to_do=='train':
                 if not(arch_freeze_flag):
                     net.train()
@@ -1710,10 +1762,7 @@ def model_init(inp_out_dict,model,config,arch_dict,use_cuda,multi_gpu,to_do):
             # addigng nn into the nns dict
             nns[arch_dict[inp1][1]]=net
             
-            if multi_gpu:
-                out_dim=net.module.out_dim
-            else:
-                out_dim=net.out_dim
+            out_dim=net.out_dim
                 
             # updating output dim
             inp_out_dict[out_name]=[out_dim]
@@ -1800,6 +1849,109 @@ def optimizer_init(nns,config,arch_dict):
             
     return optimizers
 
+
+def forward_model_refac01(fea_dict, lab_dict, arch_dict, model, nns, costs, inp, ref, inp_out_dict, max_len_fea, max_len_lab, batch_size, to_do, forward_outs):
+    def _add_input_features_to_outs_dict(fea_dict, outs_dict, inp):
+        for fea in fea_dict.keys():
+            if len(inp.shape) == 3 and len(fea_dict[fea]) > 1:
+                outs_dict[fea] = inp[:,:,fea_dict[fea][5]:fea_dict[fea][6]]
+            if len(inp.shape) == 2 and len(fea_dict[fea]) > 1:
+                outs_dict[fea] = inp[:,fea_dict[fea][5]:fea_dict[fea][6]]
+        return outs_dict
+    def _compute_layer_values(inp_out_dict, inp2, inp, inp1, max_len, batch_size, arch_dict, out_name, nns, outs_dict, to_do):
+        def _is_input_feature(inp_out_dict, inp2):
+            if len(inp_out_dict[inp2]) > 1:
+                return True
+            return False
+        def _extract_respective_feature_from_input(inp, inp_out_dict, inp2, arch_dict, inp1, max_len, batch_size):
+            if len(inp.shape) ==3 :
+                inp_dnn = inp
+                if not(bool(arch_dict[inp1][2])):
+                    inp_dnn = inp_dnn.view(max_len*batch_size,-1)
+            if len(inp.shape) == 2:
+                inp_dnn = inp
+                if bool(arch_dict[inp1][2]):
+                    inp_dnn = inp_dnn.view(max_len,batch_size,-1)
+            return inp_dnn
+        
+        do_break = False
+        if _is_input_feature(inp_out_dict, inp2):
+            inp_dnn = _extract_respective_feature_from_input(inp, inp_out_dict, inp2, arch_dict, inp1, max_len, batch_size)
+            outs_dict[out_name] = nns[inp1](inp_dnn)
+        else:
+            if not(bool(arch_dict[inp1][2])) and len(outs_dict[inp2].shape) == 3:
+                outs_dict[inp2] = outs_dict[inp2].view(outs_dict[inp2].shape[0]*outs_dict[inp2].shape[1],-1)
+            if bool(arch_dict[inp1][2]) and len(outs_dict[inp2].shape) == 2:
+                # TODO: This computation needs to be made independent of max_len in case the network is performing sub sampling in time
+                outs_dict[inp2] = outs_dict[inp2].view(max_len,batch_size,-1)
+            outs_dict[out_name] = nns[inp1](outs_dict[inp2])
+        if to_do == 'forward' and out_name == forward_outs[-1]:
+            do_break = True
+        return outs_dict, do_break
+    def _get_labels_from_input(ref, inp2, lab_dict):
+        if len(inp.shape)==3:
+            lab_dnn = ref 
+        if len(inp.shape)==2:
+            lab_dnn = ref 
+        lab_dnn=lab_dnn.view(-1).long()
+        return lab_dnn
+    def _get_network_output(outs_dict, inp1, max_len, batch_size):
+        out=outs_dict[inp1]
+        if len(out.shape) == 3:
+            out = out.view(max_len*batch_size, -1)
+        return out
+
+    outs_dict={}
+    _add_input_features_to_outs_dict(fea_dict, outs_dict, inp)
+    layer_string_pattern = '(.*)=(.*)\((.*),(.*)\)'
+    for line in model:
+        out_name, operation, inp1, inp2 = list(re.findall(layer_string_pattern,line)[0])
+        if operation == 'compute':
+            outs_dict, do_break = _compute_layer_values(inp_out_dict, inp2, inp, inp1, max_len_fea, batch_size, arch_dict, out_name, nns, outs_dict, to_do)
+            if do_break:
+                break
+        elif operation == 'cost_nll':
+            lab_dnn = _get_labels_from_input(ref, inp2, lab_dict)
+            out = _get_network_output(outs_dict, inp1, max_len_lab, batch_size)
+            if to_do != 'forward':
+                outs_dict[out_name]=costs[out_name](out, lab_dnn)
+        elif operation == 'cost_err':
+            lab_dnn = _get_labels_from_input(ref, inp2, lab_dict)
+            out = _get_network_output(outs_dict, inp1, max_len_lab, batch_size)
+            if to_do != 'forward':
+                pred = torch.max(out,dim=1)[1] 
+                err = torch.mean((pred!=lab_dnn).float())
+                outs_dict[out_name]=err
+        elif operation == 'concatenate':
+            dim_conc = len(outs_dict[inp1].shape)-1
+            outs_dict[out_name] = torch.cat((outs_dict[inp1],outs_dict[inp2]),dim_conc) #check concat axis
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'mult':
+            outs_dict[out_name] = outs_dict[inp1] * outs_dict[inp2]
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'sum':
+            outs_dict[out_name] = outs_dict[inp1] + outs_dict[inp2] 
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'mult_constant':
+            outs_dict[out_name] = outs_dict[inp1] * float(inp2)
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'sum_constant':
+            outs_dict[out_name] = outs_dict[inp1] + float(inp2)
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'avg':
+            outs_dict[out_name] = (outs_dict[inp1] + outs_dict[inp2])/2
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+        elif operation == 'mse':
+            outs_dict[out_name] = torch.mean((outs_dict[inp1] - outs_dict[inp2]) ** 2)
+            if to_do == 'forward' and out_name == forward_outs[-1]:
+                break
+    return  outs_dict
 
 
 def forward_model(fea_dict,lab_dict,arch_dict,model,nns,costs,inp,inp_out_dict,max_len,batch_size,to_do,forward_outs):
@@ -2146,7 +2298,7 @@ def expand_str_ep(str_compact,type_inp,N_ep,split_elem,mult_elem):
     
     for elem in str_compact_lst:
         elements=elem.split(mult_elem)
-        
+
         if type_inp=='int':
             try: 
                 int(elements[0])

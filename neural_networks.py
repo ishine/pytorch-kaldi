@@ -12,7 +12,12 @@ import torch.nn as nn
 import numpy as np
 from distutils.util import strtobool
 import math
+import json
 
+# uncomment below if you want to use SRU
+# and you need to install SRU: pip install sru[cuda].
+# or you can install it from source code: https://github.com/taolei87/sru.
+# import sru
 
 class LayerNorm(nn.Module):
 
@@ -155,10 +160,10 @@ class LSTM_cudnn(nn.Module):
         self.input_dim=inp_dim
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.lstm = nn.ModuleList([nn.LSTM(self.input_dim, self.hidden_size, self.num_layers, 
                             bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -179,7 +184,6 @@ class LSTM_cudnn(nn.Module):
             h0=h0.cuda()
             c0=c0.cuda()
             
-            
         output, (hn, cn) = self.lstm[0](x, (h0, c0))
         
         
@@ -194,10 +198,10 @@ class GRU_cudnn(nn.Module):
         self.input_dim=inp_dim
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.gru = nn.ModuleList([nn.GRU(self.input_dim, self.hidden_size, self.num_layers, 
                             bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -230,10 +234,10 @@ class RNN_cudnn(nn.Module):
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
         self.nonlinearity=options['nonlinearity']
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.rnn = nn.ModuleList([nn.RNN(self.input_dim, self.hidden_size, self.num_layers, 
                             nonlinearity=self.nonlinearity,bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -645,6 +649,50 @@ class GRU(nn.Module):
               
         return x
 
+class logMelFb(nn.Module):
+    def __init__(self, options,inp_dim):
+        super(logMelFb, self).__init__()
+        import torchaudio
+        self._sample_rate = int(options['logmelfb_nr_sample_rate'])
+        self._nr_of_filters = int(options['logmelfb_nr_filt'])
+        self._stft_window_size = int(options['logmelfb_stft_window_size'])
+        self._stft_window_shift = int(options['logmelfb_stft_window_shift'])
+        self._use_cuda = strtobool(options['use_cuda'])
+        self.out_dim = self._nr_of_filters
+        self._mspec = torchaudio.transforms.MelSpectrogram(
+            sr=self._sample_rate,
+            n_fft=self._stft_window_size,
+            ws=self._stft_window_size,
+            hop=self._stft_window_shift,
+            n_mels=self._nr_of_filters,
+        )
+    
+    def forward(self, x):
+        def _safe_log(inp, epsilon=1e-20):
+            eps = torch.FloatTensor([epsilon])
+            if self._use_cuda:
+                eps = eps.cuda()
+            log_inp = torch.log10(torch.max(inp, eps.expand_as(inp)))
+            return log_inp
+        assert x.shape[-1] == 1, 'Multi channel time signal processing not suppored yet'
+        x_reshape_for_stft = torch.squeeze(x, -1).transpose(0, 1)
+        if self._use_cuda:
+            window = self._mspec.window(self._stft_window_size).cuda()
+        else:
+            window = self._mspec.window(self._stft_window_size)
+        x_stft = torch.stft(
+            x_reshape_for_stft, 
+            self._stft_window_size, 
+            hop_length = self._stft_window_shift, 
+            center = False, 
+            window = window,
+        )
+        x_power_stft = x_stft.pow(2).sum(-1)
+        x_power_stft_reshape_for_filterbank_mult = x_power_stft.transpose(1, 2)
+        mel_spec = self._mspec.fm(x_power_stft_reshape_for_filterbank_mult).transpose(0, 1)
+        log_mel_spec = _safe_log(mel_spec)
+        out = log_mel_spec 
+        return out
 
 class liGRU(nn.Module):
     
@@ -1658,6 +1706,85 @@ def flip(x, dim):
     x = x.view(x.size(0), x.size(1), -1)[:, getattr(torch.arange(x.size(1)-1, -1, -1), ('cpu','cuda')[x.is_cuda])().long(), :]
     return x.view(xsize)
 
+class SRU(nn.Module):
+    def __init__(self, options, inp_dim):
+        super(SRU, self).__init__()
+        self.input_dim = inp_dim
+        self.hidden_size = int(options['sru_hidden_size'])
+        self.num_layers = int(options['sru_num_layers'])
+        self.dropout = float(options['sru_dropout'])
+        self.rnn_dropout = float(options['sru_rnn_dropout'])
+        self.use_tanh = bool(strtobool(options['sru_use_tanh']))
+        self.use_relu = bool(strtobool(options['sru_use_relu']))
+        self.use_selu = bool(strtobool(options['sru_use_selu']))
+        self.weight_norm = bool(strtobool(options['sru_weight_norm']))
+        self.layer_norm = bool(strtobool(options['sru_layer_norm']))
+        self.bidirectional = bool(strtobool(options['sru_bidirectional']))
+        self.is_input_normalized = bool(strtobool(options['sru_is_input_normalized']))
+        self.has_skip_term = bool(strtobool(options['sru_has_skip_term']))
+        self.rescale = bool(strtobool(options['sru_rescale']))
+        self.highway_bias = float(options['sru_highway_bias'])
+        self.n_proj = int(options['sru_n_proj'])
+        self.sru = sru.SRU(self.input_dim, self.hidden_size,
+                            num_layers=self.num_layers,
+                            dropout=self.dropout,
+                            rnn_dropout=self.rnn_dropout,
+                            bidirectional=self.bidirectional,
+                            n_proj=self.n_proj,
+                            use_tanh=self.use_tanh,
+                            use_selu=self.use_selu,
+                            use_relu=self.use_relu,
+                            weight_norm=self.weight_norm,
+                            layer_norm=self.layer_norm,
+                            has_skip_term=self.has_skip_term,
+                            is_input_normalized=self.is_input_normalized,
+                            highway_bias=self.highway_bias,
+                            rescale=self.rescale)
+        self.out_dim = self.hidden_size+self.bidirectional*self.hidden_size
+
+    def forward(self, x):
+        if self.bidirectional:
+            h0 = torch.zeros(self.num_layers, x.shape[1], self.hidden_size*2)
+        else:
+            h0 = torch.zeros(self.num_layers, x.shape[1], self.hidden_size)
+        if x.is_cuda:
+            h0 = h0.cuda()
+        output, hn = self.sru(x, c0=h0)
+        return output
 
 
+class PASE(nn.Module):
+    def __init__(self, options, inp_dim):
+        super(PASE, self).__init__()
+        
+        # To use PASE within PyTorch-Kaldi, please clone the current PASE repository: https://github.com/santi-pdp/pase 
+        # Note that you have to clone the dev branch.
+        # Take a look into the requirements (requirements.txt) and install in your environment what is missing. An important requirement is QRNN (https://github.com/salesforce/pytorch-qrnn). 
+        # Before starting working with PASE, it could make sense to a quick test  with QRNN independently (see “usage” section in the QRNN repository).
+        # Remember to install pase. This way it can be used outside the pase folder directory.  To do it, go into the pase folder and type:
+        # "python setup.py install"
+        
+        from pase.models.frontend import wf_builder
 
+        self.input_dim = inp_dim
+        self.pase_cfg= options['pase_cfg']
+        self.pase_model= options['pase_model']
+        
+        self.pase = wf_builder(self.pase_cfg)
+        
+        self.pase.load_pretrained(self.pase_model, load_last=True, verbose=True)
+        
+        # Reading the out_dim from the config file:
+        with open(self.pase_cfg) as json_file:
+            config = json.load(json_file)
+        
+        
+        self.out_dim = int(config['emb_dim'])
+        
+
+    def forward(self, x):
+        
+        x=x.unsqueeze(0).unsqueeze(0)
+        output=self.pase(x) 
+        
+        return output
